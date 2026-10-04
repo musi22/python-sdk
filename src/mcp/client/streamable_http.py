@@ -456,6 +456,8 @@ class StreamableHTTPTransport:
         try:
             content = await response.aread()
             message = jsonrpc_message_adapter.validate_json(content, by_name=False)
+            if isinstance(message, JSONRPCResponse | JSONRPCError) and message.id is None:
+                message.id = request_id
             session_message = SessionMessage(message)
             await read_stream_writer.send(session_message)
         except (httpx2.StreamError, ValidationError) as exc:

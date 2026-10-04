@@ -1279,3 +1279,76 @@ Redirect to http://backend.lan:8000/mcp/ not followed: it would downgrade this H
 The server is likely behind a TLS-terminating proxy whose forwarded headers it does not trust,
 often combined with a trailing-slash difference. Try https://backend.lan:8000/mcp/ instead, or fix the proxy settings.\
 """)
+
+
+@pytest.mark.anyio
+async def test_json_response_with_null_id_correlates_to_request_id() -> None:
+    """A 200 application/json response with a null JSON-RPC id (e.g. gateway error)
+    correlates to the original request id so the dispatcher waiter resolves."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600, "message": "Invalid Request"},
+            },
+        )
+
+    with anyio.fail_after(5):
+        async with (
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
+            streamable_http_client("http://test/mcp", http_client=http) as (read, write),
+        ):
+            await write.send(SessionMessage(JSONRPCRequest(jsonrpc="2.0", id="req-42", method="tools/list", params={})))
+            reply = await read.receive()
+
+    assert isinstance(reply, SessionMessage)
+    assert isinstance(reply.message, JSONRPCError)
+    assert reply.message.id == "req-42"
+    assert reply.message.error.code == -32600
+    assert reply.message.error.message == "Invalid Request"
+
+
+@pytest.mark.anyio
+async def test_client_handles_json_200_null_id_error_without_hanging() -> None:
+    """End-to-end: client raises McpError when a 200 JSON response contains an id: null error."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        method = body.get("method")
+        if method == "initialize":
+            return httpx2.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "1.0"},
+                    },
+                },
+            )
+        return httpx2.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600, "message": "Gateway error"},
+            },
+        )
+
+    with anyio.fail_after(2):
+        async with (
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
+            Client(streamable_http_client("http://test/mcp", http_client=http), mode="legacy") as client,
+        ):
+            with pytest.raises(MCPError) as exc_info:
+                await client.list_tools()
+            assert exc_info.value.error.code == -32600
+            assert exc_info.value.error.message == "Gateway error"
